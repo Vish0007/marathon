@@ -51,20 +51,34 @@ class MarathonHealthCheckManager(
       ahcs(appId)(appVersion)
     }
 
-  override def add(app: AppDefinition, healthCheck: HealthCheck): Unit =
+  override def add(app: AppDefinition, healthCheck: HealthCheck, tasks: Iterable[Task]): Unit =
     appHealthChecks.writeLock { ahcs =>
       val healthChecksForApp = listActive(app.id, app.version)
 
-      if (healthChecksForApp.exists(_.healthCheck == healthCheck))
-        log.debug(s"Not adding duplicate health check for app [$app.id] and version [${app.version}]: [$healthCheck]")
-
-      else {
+      if (healthChecksForApp.exists(_.healthCheck == healthCheck)) {
+        log.debug(s"Not adding duplicated health check for app [$app.id] and version [${app.version}]: [$healthCheck]")
+      } else {
         log.info(s"Adding health check for app [${app.id}] and version [${app.version}]: [$healthCheck]")
 
         val ref = actorRefFactory.actorOf(
           HealthCheckActor.props(app, killService, healthCheck, taskTracker, eventBus))
         val newHealthChecksForApp =
           healthChecksForApp + ActiveHealthCheck(healthCheck, ref)
+
+        if (healthCheck.protocol == Protocol.COMMAND) {
+          tasks.foreach { task =>
+            task.launched.foreach { launched =>
+              launched.status.mesosStatus match {
+                case Some(mesosStatus) if mesosStatus.hasHealthy =>
+                  val health =
+                    if (mesosStatus.getHealthy) Healthy(task.taskId, launched.runSpecVersion)
+                    else Unhealthy(task.taskId, launched.runSpecVersion, "")
+                  ref ! health
+                case None =>
+              }
+            }
+          }
+        }
 
         val appMap = ahcs(app.id) + (app.version -> newHealthChecksForApp)
         ahcs += app.id -> appMap
@@ -73,9 +87,9 @@ class MarathonHealthCheckManager(
       }
     }
 
-  override def addAllFor(app: AppDefinition): Unit =
-    appHealthChecks.writeLock { _ => // atomically add all checks
-      app.healthChecks.foreach(add(app, _))
+  override def addAllFor(app: AppDefinition, tasks: Iterable[Task]): Unit =
+    appHealthChecks.writeLock { _ => // atomically add all checks for this app version
+      app.healthChecks.foreach(add(app, _, tasks))
     }
 
   override def remove(appId: PathId, appVersion: Timestamp, healthCheck: HealthCheck): Unit =
@@ -112,13 +126,26 @@ class MarathonHealthCheckManager(
       }
     }
 
-  override def reconcileWith(appId: PathId): Future[Unit] =
-    appRepository.get(appId) flatMap {
+  override def reconcileWith(appId: PathId): Future[Unit] = {
+    def groupTasksByVersion(tasks: Iterable[Task]): Map[Timestamp, List[Task]] =
+      tasks.foldLeft(Map[Timestamp, List[Task]]()) {
+        case (acc, task) =>
+          task.launched match {
+            case Some(launched) =>
+              val version = launched.runSpecVersion
+              acc + (version -> (task :: acc.getOrElse(version, Nil)))
+            case None => acc
+          }
+      }
+
+    appRepository.get(appId).flatMap {
       case None => Future(())
       case Some(app) =>
         log.info(s"reconcile [$appId] with latest version [${app.version}]")
 
         val tasks: Iterable[Task] = taskTracker.appTasksSync(app.id)
+        val tasksByVersion = groupTasksByVersion(tasks)
+
         val activeAppVersions: Set[Timestamp] =
           tasks.iterator.flatMap(_.launched.map(_.runSpecVersion)).toSet + app.version
 
@@ -149,11 +176,12 @@ class MarathonHealthCheckManager(
 
             case Some(appVersion) =>
               log.info(s"addAllFor [$appId] version [$version]")
-              addAllFor(appVersion)
+              addAllFor(appVersion, tasksByVersion.getOrElse(version, Seq.empty))
           }
         }
         Future.sequence(res) map { _ => () }
     }
+  }
 
   override def update(taskStatus: TaskStatus, version: Timestamp): Unit =
     appHealthChecks.readLock { ahcs =>
